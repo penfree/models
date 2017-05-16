@@ -869,3 +869,14 @@ sh_test(
     ],
     tags = ["slow"],
 )
+
+py_binary(
+    name = "textparser",
+    srcs = ["textparser.py"],
+    deps = [
+        ":graph_builder",
+        ":sentence_py_pb2",
+        ":structured_graph_builder",
+        ":task_spec_py_pb2",
+    ],
+)
