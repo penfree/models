@@ -36,66 +36,8 @@ import cgi
 
 from BaseHTTPServer import BaseHTTPRequestHandler
 from BaseHTTPServer import HTTPServer
-
-flags = tf.app.flags
-FLAGS = flags.FLAGS
-
-
-flags.DEFINE_string('task_context', '',
-                    'Path to a task context with inputs and parameters for '
-                    'feature extractors.')
-flags.DEFINE_string('resource_dir', '',
-                    'Optional base directory for task context resources.')
-flags.DEFINE_string('model_path', '', 'Path to model parameters.')
-flags.DEFINE_string('arg_prefix', None, 'Prefix for context parameters.')
-flags.DEFINE_string('graph_builder', 'greedy',
-                    'Which graph builder to use, either greedy or structured.')
-flags.DEFINE_string('input', 'stdin',
-                    'Name of the context input to read data from.')
-flags.DEFINE_string('output', 'stdout',
-                    'Name of the context input to write data to.')
-flags.DEFINE_string('hidden_layer_sizes', '200,200',
-                    'Comma separated list of hidden layer sizes.')
-flags.DEFINE_integer('batch_size', 32,
-                     'Number of sentences to process in parallel.')
-flags.DEFINE_integer('beam_size', 8, 'Number of slots for beam parsing.')
-flags.DEFINE_integer('max_steps', 1000, 'Max number of steps to take.')
-flags.DEFINE_bool('slim_model', False,
-                  'Whether to expect only averaged variables.')
-
-MODEL_DIR = '/home/ubuntu/models/syntaxnet/'
-USE_SLIM_MODEL = True
-
-TASK_CONTEXT = '/home/ubuntu/models/syntaxnet/models/brain_pos/greedy/128-0.008-10000-0.9-0/context'
-TASK_INPUT = 'stdin'
-TASK_OUTPUT = 'stdout-conll'
-
-HIDDEN_LAYER = '256,256'
-ARG_PREFIX = 'brain_pos'
-MODEL_PATH = 'models/brain_pos/greedy/128-0.008-10000-0.9-0/model'
-BATCH_SIZE = 32
-MAX_STEPS = 1000
-
-PORT_NUMBER = 5080
-
-
-def RewriteContext(task_context, in_corpus_name):
-    context = task_spec_pb2.TaskSpec()
-    with gfile.FastGFile(task_context, 'rb') as fin:
-        text_format.Merge(fin.read(), context)
-    tf_in = tempfile.NamedTemporaryFile(delete=False)
-    for resource in context.input:
-        for part in resource.part:
-            if part.file_pattern != '-':
-                part.file_pattern = os.path.join(MODEL_DIR, part.file_pattern)
-        if resource.name == in_corpus_name:
-            for part in resource.part:
-                if part.file_pattern == '-':
-                    part.file_pattern = tf_in.name
-    fout = tempfile.NamedTemporaryFile(delete=False)
-    fout.write(str(context))
-    return fout.name, tf_in.name
-
+import jieba.posseg as pseg
+from os.path import join
 
 def UnderscoreIfEmpty(part):
     if not part:
@@ -145,38 +87,47 @@ def ConvertToString(sentence):
     return unicode('\n').join(lines) + unicode('\n\n')
 
 
-class PosParserEval(object):
+class TextParserEval(object):
 
-    def __init__(self, task_context, arg_prefix, hidden_layer_sizes, model_path, in_corpus_name, out_corpus_name):
-        self.task_context, self.in_name = RewriteContext(
+    def __init__(self, task_context, arg_prefix, hidden_layer_sizes, model_dir,
+                 model_path, in_corpus_name, out_corpus_name, batch_size,
+                 max_steps, use_slim_model=True):
+        self.model_dir = model_dir
+        self.task_context, self.in_name = self.RewriteContext(
             task_context, in_corpus_name)
         self.arg_prefix = arg_prefix
-        self.sess = tf.Session()
+        self.graph = tf.Graph()
         self.in_corpus_name = in_corpus_name
         self.out_corpus_name = out_corpus_name
-        feature_sizes, domain_sizes, embedding_dims, num_actions = self.sess.run(
-            gen_parser_ops.feature_size(task_context=self.task_context,
-                                        arg_prefix=self.arg_prefix))
+        with self.graph.as_default():
+            self.sess = tf.Session()
+            feature_sizes, domain_sizes, embedding_dims, num_actions = self.sess.run(
+                gen_parser_ops.feature_size(task_context=self.task_context,
+                                            arg_prefix=self.arg_prefix))
         self.feature_sizes = feature_sizes
         self.domain_sizes = domain_sizes
         self.embedding_dims = embedding_dims
         self.num_actions = num_actions
         self.hidden_layer_sizes = map(int, hidden_layer_sizes.split(','))
-        self.parser = graph_builder.GreedyParser(
-            self.num_actions,
-            self.feature_sizes,
-            self.domain_sizes,
-            self.embedding_dims,
-            self.hidden_layer_sizes,
-            gate_gradients=True,
-            arg_prefix=self.arg_prefix)
-        self.parser.AddEvaluation(self.task_context,
-                                  BATCH_SIZE,
-                                  corpus_name=self.in_corpus_name,
-                                  evaluation_max_steps=MAX_STEPS)
-        self.parser.AddSaver(USE_SLIM_MODEL)
-        self.sess.run(self.parser.inits.values())
-        self.parser.saver.restore(self.sess, os.path.join(MODEL_DIR, model_path))
+        self.batch_size = batch_size
+        self.max_steps = max_steps
+        self.use_slim_model = use_slim_model
+        with self.graph.as_default():
+            self.parser = graph_builder.GreedyParser(
+                self.num_actions,
+                self.feature_sizes,
+                self.domain_sizes,
+                self.embedding_dims,
+                self.hidden_layer_sizes,
+                gate_gradients=True,
+                arg_prefix=self.arg_prefix)
+            self.parser.AddEvaluation(self.task_context,
+                                    self.batch_size,
+                                    corpus_name=self.in_corpus_name,
+                                    evaluation_max_steps=self.max_steps)
+            self.parser.AddSaver(self.use_slim_model)
+            self.sess.run(self.parser.inits.values())
+            self.parser.saver.restore(self.sess, os.path.join(self.model_dir, model_path))
 
     def RewriteContext(self, task_context, in_corpus_name):
         context = task_spec_pb2.TaskSpec()
@@ -186,7 +137,7 @@ class PosParserEval(object):
         for resource in context.input:
             for part in resource.part:
                 if part.file_pattern != '-':
-                    part.file_pattern = os.path.join(MODEL_DIR, part.file_pattern)
+                    part.file_pattern = os.path.join(self.model_dir, part.file_pattern)
             if resource.name == in_corpus_name:
                 for part in resource.part:
                     if part.file_pattern == '-':
@@ -201,103 +152,82 @@ class PosParserEval(object):
         # os.remove(self.out_name)
 
     def Parse(self, sentence):
-        with open(self.in_name, "w") as f:
-            f.write(sentence)
+        with self.graph.as_default():
+            with open(self.in_name, "w") as f:
+                f.write(sentence)
 
-        self.parser.AddEvaluation(self.task_context,
-                                  BATCH_SIZE,
-                                  corpus_name=self.in_corpus_name,
-                                  evaluation_max_steps=MAX_STEPS)
-        # tf_documents = self.sess.run([self.parser.evaluation['documents'],])
-        num_epochs = None
-        num_docs = 0
-        while True:
-            tf_epochs, _, tf_documents = self.sess.run([self.parser.evaluation['epochs'],
-                                                        self.parser.evaluation[
-                'eval_metrics'],
-                self.parser.evaluation['documents']])
-            print len(tf_documents)
-            # assert len(tf_documents) == 1
-            # print type(tf_documents[len(tf_documents)-1])
-            if len(tf_documents) > 0:
-                doc = sentence_pb2.Sentence()
-                doc.ParseFromString(tf_documents[len(tf_documents) - 1])
-                # print unicode(doc)
-                return ConvertToString(doc)
-            if num_epochs is None:
-                num_epochs = tf_epochs
-            elif num_epochs < tf_epochs:
-                break
+            self.parser.AddEvaluation(self.task_context,
+                                    self.batch_size,
+                                    corpus_name=self.in_corpus_name,
+                                    evaluation_max_steps=self.max_steps)
+            # tf_documents = self.sess.run([self.parser.evaluation['documents'],])
+            num_epochs = None
+            num_docs = 0
+            while True:
+                tf_epochs, _, tf_documents = self.sess.run([self.parser.evaluation['epochs'],
+                                                            self.parser.evaluation[
+                    'eval_metrics'],
+                    self.parser.evaluation['documents']])
+                #print len(tf_documents)
+                # assert len(tf_documents) == 1
+                # print type(tf_documents[len(tf_documents)-1])
+                if len(tf_documents) > 0:
+                    doc = sentence_pb2.Sentence()
+                    doc.ParseFromString(tf_documents[len(tf_documents) - 1])
+                    # print unicode(doc)
+                    return ConvertToString(doc)
+                if num_epochs is None:
+                    num_epochs = tf_epochs
+                elif num_epochs < tf_epochs:
+                    break
+
+class TextParser(object):
+    '''
+        Use syntaxnet model to parse text
+    '''
+    def __init__(self, model_dir, pos_param, parser_param, pos_hidden_layer,
+                 parser_hidden_layer, pos_batch_size=32, pos_max_steps=1000,
+                 parser_batch_size=8, parser_max_steps=1000, pos_use_slim=True,
+                 parser_use_slim=True):
+        self.pos_parser = TextParserEval(
+            join(model_dir, 'models/brain_pos/greedy', pos_param, 'context'),
+            'brain_pos',
+            pos_hidden_layer,
+            model_dir,
+            join('models/brain_pos/greedy', pos_param, 'model'),
+            'stdin', 'stdout-conll',
+            pos_batch_size,
+            pos_max_steps,
+            pos_use_slim
+        )
+        self.parser = TextParserEval(
+            join(model_dir, 'models/brain_parser/structured', parser_param, 'context'),
+            'brain_parser',
+            parser_hidden_layer,
+            model_dir,
+            join('models/brain_parser/structured', parser_param, 'model'),
+            'stdin-conll', 'stdout-conll',
+            parser_batch_size,
+            parser_max_steps,
+            parser_use_slim
+        )
+
+    def parse(self, text):
+        if not isinstance(text, unicode):
+            text = text.decode('utf-8')
+
+        # cut words
+        seg_list = [word for word, flag in pseg.cut(text)]
+        target_text = u' '.join(seg_list).encode('utf-8')
+
+        target_text = self.pos_parser.Parse(target_text)
+
+        target_text = self.parser.Parse(target_text)
+        return target_text
 
 
-class ParserParserEval(object):
-
-    def __init__(self, task_context, arg_prefix, hidden_layer_sizes, model_path, in_corpus_name, out_corpus_name):
-        self.task_context, self.in_name = RewriteContext(task_context, in_corpus_name)
-        self.arg_prefix = arg_prefix
-        self.sess = tf.Session()
-        self.in_corpus_name = in_corpus_name
-        self.out_corpus_name = out_corpus_name
-        feature_sizes, domain_sizes, embedding_dims, num_actions = self.sess.run(
-            gen_parser_ops.feature_size(task_context=self.task_context,
-                                        arg_prefix=self.arg_prefix))
-        self.feature_sizes = feature_sizes
-        self.domain_sizes = domain_sizes
-        self.embedding_dims = embedding_dims
-        self.num_actions = num_actions
-        self.hidden_layer_sizes = map(int, hidden_layer_sizes.split(','))
-        self.parser = graph_builder.GreedyParser(
-            self.num_actions,
-            self.feature_sizes,
-            self.domain_sizes,
-            self.embedding_dims,
-            self.hidden_layer_sizes,
-            gate_gradients=True,
-            arg_prefix=self.arg_prefix)
-        self.parser.AddEvaluation(self.task_context,
-                                  BATCH_SIZE,
-                                  corpus_name=self.in_corpus_name,
-                                  evaluation_max_steps=MAX_STEPS)
-        self.parser.AddSaver(USE_SLIM_MODEL)
-        self.sess.run(self.parser.inits.values())
-        self.parser.saver.restore(self.sess, os.path.join(MODEL_DIR, model_path))
-
-    def __del__(self):
-        os.remove(self.task_context)
-        # os.remove(self.in_name)
-        # os.remove(self.out_name)
-
-    def Parse(self, sentence):
-        with open(self.in_name, "w") as f:
-            f.write(sentence)
-
-        self.parser.AddEvaluation(self.task_context,
-                                  BATCH_SIZE,
-                                  corpus_name=self.in_corpus_name,
-                                  evaluation_max_steps=MAX_STEPS)
-        # tf_documents = self.sess.run([self.parser.evaluation['documents'],])
-        num_epochs = None
-        num_docs = 0
-        while True:
-            tf_epochs, _, tf_documents = self.sess.run([self.parser.evaluation['epochs'],
-                                                        self.parser.evaluation['eval_metrics'],
-                                                        self.parser.evaluation['documents']])
-            print len(tf_documents)
-            # assert len(tf_documents) == 1
-            # print type(tf_documents[len(tf_documents)-1])
-            if len(tf_documents) > 0:
-                doc = sentence_pb2.Sentence()
-                doc.ParseFromString(tf_documents[len(tf_documents) - 1])
-                # print unicode(doc)
-                return ConvertToString(doc)
-            if num_epochs is None:
-                num_epochs = tf_epochs
-            elif num_epochs < tf_epochs:
-                break
-
-def main(unused_args):
-    print ParserParserEval.__name__
-    print PosParserEval.__name__
+def main():
+    print TextParser.__name__
 
 if __name__ == '__main__':
-    tf.app.run()
+    main()
